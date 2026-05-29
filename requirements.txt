@@ -21,3 +21,4 @@ setuptools
 selenium>=4.0.0
 webdriver-manager
 terabox-downloader
+uvloop
