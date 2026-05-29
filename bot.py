@@ -7,7 +7,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from config import API_ID, API_HASH, BOT_TOKEN, RTMP_URL, STREAM_KEY, OWNER_ID, PORT
 
-# ── Health check server for Koyeb ──────────────────────────────────────────────
+## ── Health check server for Koyeb ──────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
