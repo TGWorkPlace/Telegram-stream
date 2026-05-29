@@ -29,7 +29,8 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-current_stream = None  # Track active ffmpeg process
+current_stream: subprocess.Popen | None = None
+stream_task: asyncio.Task | None = None
 
 # ── /start ─────────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
@@ -56,17 +57,27 @@ async def status_cmd(client: Client, message: Message):
 # ── /stop ──────────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("stop"))
 async def stop_stream(client: Client, message: Message):
-    global current_stream
+    global current_stream, stream_task
     if current_stream and current_stream.poll() is None:
         current_stream.terminate()
+        if stream_task and not stream_task.done():
+            stream_task.cancel()
         await message.reply("⏹️ Stream stopped.")
     else:
         await message.reply("⚪ No active stream to stop.")
 
+# ── Background async watcher ───────────────────────────────────────────────────
+async def _watch_stream(process: subprocess.Popen, message: Message, file_path: str):
+    """Wait for ffmpeg to finish, then clean up the file."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, process.wait)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
 # ── Video/Document handler ─────────────────────────────────────────────────────
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_video(client: Client, message: Message):
-    global current_stream
+    global current_stream, stream_task
 
     # Owner-only guard
     if OWNER_ID and message.from_user.id != OWNER_ID:
@@ -91,18 +102,16 @@ async def handle_video(client: Client, message: Message):
 
     await status.edit("📡 Preparing stream...")
 
+    # Stream copy: no re-encoding — zero CPU lag.
+    # Requires source to be H.264 video + AAC audio (standard for most MP4s).
+    # If the stream fails immediately, the source codec may be incompatible;
+    # swap -c:v copy / -c:a copy for libx264 / aac as a fallback.
     ffmpeg_cmd = [
-        "ffmpeg", "-re",
+        "ffmpeg",
+        "-re",                    # Read at native frame rate (crucial for live RTMP)
         "-i", file_path,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-b:v", "1500k",
-        "-maxrate", "1500k",
-        "-bufsize", "3000k",
-        "-vf", "scale=1280:720",
-        "-g", "50",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "-c:v", "copy",           # No video re-encode — eliminates CPU lag
+        "-c:a", "copy",           # No audio re-encode
         "-f", "flv",
         f"{RTMP_URL}{STREAM_KEY}"
     ]
@@ -110,31 +119,26 @@ async def handle_video(client: Client, message: Message):
     try:
         current_stream = subprocess.Popen(
             ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE   # Keep stderr so errors are readable if needed
         )
         await status.edit(
             "🔴 **Streaming live!**\n\n"
             "Use /stop to end the stream."
         )
 
-        # Watch ffmpeg in background and notify when done
-        asyncio.get_event_loop().run_in_executor(
-            None, _watch_stream, current_stream, message, file_path
+        # Schedule async watcher — properly tied to the running event loop
+        stream_task = asyncio.get_event_loop().create_task(
+            _watch_stream(current_stream, message, file_path)
         )
 
     except Exception as e:
         await status.edit(f"❌ Stream failed:\n`{e}`")
-
-# ── Background watcher: cleans up file when stream ends ───────────────────────
-def _watch_stream(process, message, file_path):
-    process.wait()
-    if os.path.exists(file_path):
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 # ── Main entry ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Start health check server in background thread
     thread = threading.Thread(target=run_health_server, daemon=True)
     thread.start()
     print(f"✅ Health server running on port {PORT}")
