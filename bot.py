@@ -1,3 +1,4 @@
+# bot.py
 import asyncio
 import os
 import signal
@@ -21,11 +22,8 @@ from config import (
     OWNER_ID,
     PORT,
 )
-from database import save_target, get_all_targets, get_target, delete_target
+from database import save_target, get_all_targets, get_target, delete_target, ping_db
 
-# ─────────────────────────────────────────────────────────────
-# Optional uvloop
-# ─────────────────────────────────────────────────────────────
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -65,15 +63,12 @@ current_stream: asyncio.subprocess.Process | None = None
 stream_task: asyncio.Task | None = None
 current_file: str | None = None
 
-# Tracks users currently in /save flow
 _save_pending: set[int] = set()
-
-# Tracks a pending video waiting for channel selection {user_id: message}
 _pending_video: dict[int, Message] = {}
 
 
 # ─────────────────────────────────────────────────────────────
-# Helpers: progress bar + formatting
+# Helpers
 # ─────────────────────────────────────────────────────────────
 def make_bar(percent: float, width: int = 18) -> str:
     filled = int(width * percent / 100)
@@ -106,7 +101,7 @@ def fmt_time(s: float) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Download progress callback factory
+# Download progress callback
 # ─────────────────────────────────────────────────────────────
 def make_progress_callback(status_msg: Message, total_size: int):
     state = {"last_t": 0.0}
@@ -158,7 +153,7 @@ async def kill_process(process: asyncio.subprocess.Process):
 
 
 # ─────────────────────────────────────────────────────────────
-# Get video duration via ffprobe
+# Get video duration
 # ─────────────────────────────────────────────────────────────
 async def get_duration(file_path: str) -> float:
     try:
@@ -178,7 +173,7 @@ async def get_duration(file_path: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────
-# Stream watcher with live status updates
+# Stream watcher
 # ─────────────────────────────────────────────────────────────
 async def watch_stream(
     process: asyncio.subprocess.Process,
@@ -238,7 +233,7 @@ async def watch_stream(
 
 
 # ─────────────────────────────────────────────────────────────
-# Internal: start streaming to a target
+# Start stream
 # ─────────────────────────────────────────────────────────────
 async def start_stream(file_path: str, rtmp_url: str, stream_key: str, status_msg: Message):
     global current_stream, stream_task
@@ -291,8 +286,26 @@ async def start_cmd(client: Client, message: Message):
         "• /save — Save a stream target\n"
         "• /delete — Delete a stream target\n"
         "• /status — Stream status\n"
-        "• /stop — Stop stream"
+        "• /stop — Stop stream\n"
+        "• /ping\\_db — Test DB connection"
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# /ping_db  — test MongoDB connectivity
+# ─────────────────────────────────────────────────────────────
+@app.on_message(filters.command("ping_db") & filters.private)
+async def ping_db_cmd(client: Client, message: Message):
+    if OWNER_ID and message.from_user.id != OWNER_ID:
+        await message.reply("🚫 Unauthorized.")
+        return
+
+    msg = await message.reply("🔄 Pinging MongoDB...")
+    ok, info = await ping_db()
+    if ok:
+        await msg.edit_text(f"✅ **DB OK**\n`{info}`")
+    else:
+        await msg.edit_text(f"❌ **DB Error:**\n`{info}`")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -335,7 +348,7 @@ async def stop_stream(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# /save  — ask user to provide link, key, name
+# /save
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.command("save") & filters.private)
 async def save_cmd(client: Client, message: Message):
@@ -357,7 +370,7 @@ async def save_cmd(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# /delete — show inline buttons for each saved target
+# /delete
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.command("delete") & filters.private)
 async def delete_cmd(client: Client, message: Message):
@@ -383,7 +396,7 @@ async def delete_cmd(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: delete button pressed
+# Callback: delete
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^del:"))
 async def on_delete_cb(client: Client, cb: CallbackQuery):
@@ -391,10 +404,11 @@ async def on_delete_cb(client: Client, cb: CallbackQuery):
         await cb.answer("🚫 Unauthorized.", show_alert=True)
         return
 
-    name = cb.data[4:]  # strip "del:"
+    name = cb.data[4:]
 
     if name == "__cancel__":
         await cb.message.edit_text("❌ Cancelled.")
+        await cb.answer()
         return
 
     deleted = await delete_target(name)
@@ -407,7 +421,7 @@ async def on_delete_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: channel selection button pressed
+# Callback: channel selection
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^stream:"))
 async def on_stream_select_cb(client: Client, cb: CallbackQuery):
@@ -416,7 +430,7 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
         return
 
     uid = cb.from_user.id
-    name = cb.data[7:]  # strip "stream:"
+    name = cb.data[7:]
 
     if name == "__cancel__":
         _pending_video.pop(uid, None)
@@ -436,7 +450,6 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
         await cb.answer()
         return
 
-    # Prevent multiple streams
     if current_stream and current_stream.returncode is None:
         await cb.message.edit_text(
             "⚠️ Stream already running.\nUse /stop first."
@@ -444,7 +457,6 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
         await cb.answer()
         return
 
-    # Get total file size
     if video_msg.video:
         total_size = video_msg.video.file_size or 0
     else:
@@ -482,16 +494,19 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Text handler — catches /save replies AND any plain text
+# Text handler — /save replies
 # ─────────────────────────────────────────────────────────────
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "save", "delete", "status", "stop"]))
+@app.on_message(
+    filters.private
+    & filters.text
+    & ~filters.command(["start", "save", "delete", "status", "stop", "ping_db"])
+)
 async def on_text(client: Client, message: Message):
     uid = message.from_user.id
 
     if uid not in _save_pending:
         return
 
-    # Parse the 3-line format
     lines = [l.strip() for l in message.text.strip().splitlines() if l.strip()]
     if len(lines) != 3:
         await message.reply(
@@ -503,7 +518,7 @@ async def on_text(client: Client, message: Message):
     link, key, name = lines
     _save_pending.discard(uid)
 
-    ok = await save_target(name=name, link=link, key=key)
+    ok, err = await save_target(name=name, link=link, key=key)
     if ok:
         await message.reply(
             f"✅ **Saved!**\n\n"
@@ -512,11 +527,15 @@ async def on_text(client: Client, message: Message):
             f"🔑 Key: `{key}`"
         )
     else:
-        await message.reply("❌ Failed to save. Check logs.")
+        await message.reply(
+            f"❌ **Failed to save.**\n\n"
+            f"**Error:** `{err}`\n\n"
+            f"Run /ping\\_db to test your MongoDB connection."
+        )
 
 
 # ─────────────────────────────────────────────────────────────
-# Video handler — shows channel selection buttons
+# Video handler
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_video(client: Client, message: Message):
@@ -526,7 +545,6 @@ async def handle_video(client: Client, message: Message):
         await message.reply("🚫 Unauthorized.")
         return
 
-    # Validate file type
     is_video = bool(message.video)
     is_video_doc = (
         message.document
@@ -537,7 +555,6 @@ async def handle_video(client: Client, message: Message):
         await message.reply("❌ Please send a video file.")
         return
 
-    # Load targets from DB
     targets = await get_all_targets()
     if not targets:
         await message.reply(
@@ -546,7 +563,6 @@ async def handle_video(client: Client, message: Message):
         )
         return
 
-    # Stash the video message for after selection
     _pending_video[uid] = message
 
     buttons = [
