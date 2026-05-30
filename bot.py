@@ -28,17 +28,22 @@ from database import (
     add_admin, remove_admin, get_all_admins,
 )
 
+# ─────────────────────────────────────────────────────────────
+# uvloop — import only; do NOT set the event loop policy here.
+# Setting it before asyncio.run() causes Pyrogram's SQLite
+# storage to bind to a different loop → "attached to a different
+# loop" RuntimeError.  We call uvloop.run() directly instead.
+# ─────────────────────────────────────────────────────────────
 try:
     import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except Exception:
-    pass
+    _UVLOOP = True
+except ImportError:
+    _UVLOOP = False
 
 
 # ─────────────────────────────────────────────────────────────
-# ADMINS — in-memory cache, seeded from DB inside Pyrogram's
-# own event loop (see _main).  Never loaded in a separate loop.
-# OWNER_ID always has full access regardless of this set.
+# ADMINS — in-memory cache, seeded from DB inside _main()
+# after the event loop is running.  OWNER_ID always passes.
 # ─────────────────────────────────────────────────────────────
 ADMINS: set[int] = set()
 
@@ -462,7 +467,7 @@ async def removeadmin_cmd(client: Client, message: Message):
         return
 
     deleted = await remove_admin(uid)
-    ADMINS.discard(uid)   # always clean cache regardless of DB result
+    ADMINS.discard(uid)
     if deleted:
         await message.reply(f"✅ **Admin removed:** `{uid}`")
     else:
@@ -775,31 +780,41 @@ async def handle_video(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Main — everything runs in ONE event loop (asyncio.run → _main)
-# Motor is first touched inside _main, so it binds to this loop.
+# Main
+#
+# Why not asyncio.run() + uvloop.EventLoopPolicy()?
+#   Setting the policy BEFORE asyncio.run() creates a policy
+#   mismatch: Pyrogram's SQLite storage grabs the old default
+#   loop internally, then asyncio.run() creates a uvloop →
+#   "Future attached to a different loop" RuntimeError.
+#
+# Solution:
+#   • If uvloop is available → uvloop.run() creates the loop
+#     itself and everything (Pyrogram, Motor, subprocesses)
+#     is bound to that one loop from the start.
+#   • If uvloop is not installed → plain asyncio.run(), works
+#     identically, just slightly slower.
 # ─────────────────────────────────────────────────────────────
 async def _main():
-    # Start health server in a background thread (it's sync, so fine)
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     print(f"✅ Health server running on port {PORT}")
 
-    # Start the Pyrogram client
     await app.start()
     print("✅ Bot started.")
 
-    # NOW the event loop is running — safe to touch Motor for the first time
+    # Motor is first touched here — safely bound to the running loop
     ids = await get_all_admins()
     ADMINS.update(ids)
     print(f"✅ Loaded {len(ids)} admin(s) from DB: {ids}")
 
-    # Keep running until interrupted
     await idle()
-
-    # Graceful shutdown
     await app.stop()
     print("✅ Bot stopped.")
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    if _UVLOOP:
+        uvloop.run(_main())
+    else:
+        asyncio.run(_main())
