@@ -1,6 +1,7 @@
 # bot.py
 import asyncio
 import os
+import re
 import signal
 import threading
 import time
@@ -22,13 +23,51 @@ from config import (
     OWNER_ID,
     PORT,
 )
-from database import save_target, get_all_targets, get_target, delete_target, ping_db
+from database import (
+    save_target, get_all_targets, get_target, delete_target, ping_db,
+    add_admin, remove_admin, get_all_admins, is_admin_in_db,
+)
 
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except Exception:
     pass
+
+
+# ─────────────────────────────────────────────────────────────
+# ADMINS — in-memory cache, seeded from DB on startup.
+# Writes go to both the cache and DB so they survive restarts.
+# OWNER_ID always has full access regardless of this set.
+# ─────────────────────────────────────────────────────────────
+ADMINS: set[int] = set()
+
+
+async def load_admins_from_db() -> None:
+    """Populate the in-memory ADMINS cache from MongoDB."""
+    ids = await get_all_admins()
+    ADMINS.update(ids)
+    print(f"✅ Loaded {len(ids)} admin(s) from DB: {ids}")
+
+
+def is_authorized(user_id: int) -> bool:
+    """Return True if user is the owner or a persisted admin."""
+    if OWNER_ID and user_id == OWNER_ID:
+        return True
+    return user_id in ADMINS
+
+
+# ─────────────────────────────────────────────────────────────
+# URL detector
+# ─────────────────────────────────────────────────────────────
+URL_RE = re.compile(
+    r"^(https?|rtmp|rtmps|rtsp|mms|srt)://\S+",
+    re.IGNORECASE,
+)
+
+
+def is_url(text: str) -> bool:
+    return bool(URL_RE.match(text.strip()))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -61,10 +100,23 @@ app = Client(
 
 current_stream: asyncio.subprocess.Process | None = None
 stream_task: asyncio.Task | None = None
-current_file: str | None = None
+current_file: str | None = None          # None when streaming from URL
 
 _save_pending: set[int] = set()
 _pending_video: dict[int, Message] = {}
+_pending_url: dict[int, str] = {}        # uid -> direct URL to stream
+
+
+# ─────────────────────────────────────────────────────────────
+# Startup hook — load admins before the bot starts handling msgs
+# ─────────────────────────────────────────────────────────────
+@app.on_message(filters.command("start") & filters.private, group=-999)
+async def _noop(_c, _m):
+    pass  # dummy; real startup is done via asyncio task below
+
+
+async def _startup():
+    await load_admins_from_db()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -153,16 +205,16 @@ async def kill_process(process: asyncio.subprocess.Process):
 
 
 # ─────────────────────────────────────────────────────────────
-# Get video duration
+# Get video duration  (works for both local files and URLs)
 # ─────────────────────────────────────────────────────────────
-async def get_duration(file_path: str) -> float:
+async def get_duration(source: str) -> float:
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe",
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            file_path,
+            source,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -177,7 +229,7 @@ async def get_duration(file_path: str) -> float:
 # ─────────────────────────────────────────────────────────────
 async def watch_stream(
     process: asyncio.subprocess.Process,
-    file_path: str,
+    file_path: str | None,          # None when source is a URL
     status_msg: Message,
     total_duration: float,
 ):
@@ -224,30 +276,39 @@ async def watch_stream(
             await status_msg.edit_text("✅ **Stream ended.**")
         except Exception:
             pass
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                print(f"🗑 Deleted: {file_path}")
-        except Exception as e:
-            print(f"Cleanup error: {e}")
+        # Only delete if it was a local file (not URL streaming)
+        if file_path:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print(f"🗑 Deleted: {file_path}")
+            except Exception as e:
+                print(f"Cleanup error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-# Start stream
+# Build FFmpeg command
 # ─────────────────────────────────────────────────────────────
-async def start_stream(file_path: str, rtmp_url: str, stream_key: str, status_msg: Message):
-    global current_stream, stream_task
+def build_ffmpeg_cmd(
+    source: str,
+    rtmp_url: str,
+    stream_key: str,
+    is_url_source: bool,
+) -> list[str]:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
 
-    total_duration = await get_duration(file_path)
+    if is_url_source:
+        cmd += [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
 
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
+    cmd += [
         "-re",
         "-fflags", "nobuffer",
         "-flags", "low_delay",
-        "-i", file_path,
+        "-i", source,
         "-c:v", "copy",
         "-c:a", "copy",
         "-muxdelay", "0",
@@ -256,6 +317,23 @@ async def start_stream(file_path: str, rtmp_url: str, stream_key: str, status_ms
         "-f", "flv",
         f"{rtmp_url}{stream_key}",
     ]
+    return cmd
+
+
+# ─────────────────────────────────────────────────────────────
+# Start stream  (unified for file and URL)
+# ─────────────────────────────────────────────────────────────
+async def start_stream(
+    source: str,
+    rtmp_url: str,
+    stream_key: str,
+    status_msg: Message,
+    is_url_source: bool = False,
+):
+    global current_stream, stream_task, current_file
+
+    total_duration = await get_duration(source)
+    ffmpeg_cmd = build_ffmpeg_cmd(source, rtmp_url, stream_key, is_url_source)
 
     current_stream = await asyncio.create_subprocess_exec(
         *ffmpeg_cmd,
@@ -263,12 +341,16 @@ async def start_stream(file_path: str, rtmp_url: str, stream_key: str, status_ms
         stderr=asyncio.subprocess.DEVNULL,
     )
 
+    file_to_clean = None if is_url_source else source
+    current_file = file_to_clean
+
     stream_task = asyncio.create_task(
-        watch_stream(current_stream, file_path, status_msg, total_duration)
+        watch_stream(current_stream, file_to_clean, status_msg, total_duration)
     )
 
+    source_label = "🌐 URL" if is_url_source else "📁 File"
     await status_msg.edit_text(
-        "🔴 **Streaming live!**\n\n"
+        f"🔴 **Streaming live!** ({source_label})\n\n"
         "Use /stop to end stream."
     )
 
@@ -280,23 +362,27 @@ async def start_stream(file_path: str, rtmp_url: str, stream_key: str, status_ms
 async def start_cmd(client: Client, message: Message):
     await message.reply(
         "👋 **Telegram Stream Bot**\n\n"
-        "Send a video and I will stream it live.\n\n"
+        "Send a **video file** or a **direct URL** and I will stream it live.\n\n"
         "**Commands:**\n"
         "• /start — Show help\n"
         "• /save — Save a stream target\n"
         "• /delete — Delete a stream target\n"
         "• /status — Stream status\n"
         "• /stop — Stop stream\n"
-        "• /ping\\_db — Test DB connection"
+        "• /addadmin `<user_id>` — Grant admin access _(owner only)_\n"
+        "• /removeadmin `<user_id>` — Revoke admin access _(owner only)_\n"
+        "• /admins — List all admins _(owner only)_\n"
+        "• /ping\\_db — Test DB connection\n\n"
+        "ℹ️ URL streaming uses **zero transcoding CPU** — forwarded directly."
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# /ping_db  — test MongoDB connectivity
+# /ping_db
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.command("ping_db") & filters.private)
 async def ping_db_cmd(client: Client, message: Message):
-    if OWNER_ID and message.from_user.id != OWNER_ID:
+    if not is_authorized(message.from_user.id):
         await message.reply("🚫 Unauthorized.")
         return
 
@@ -314,7 +400,8 @@ async def ping_db_cmd(client: Client, message: Message):
 @app.on_message(filters.command("status") & filters.private)
 async def status_cmd(client: Client, message: Message):
     if current_stream and current_stream.returncode is None:
-        await message.reply("🔴 **Stream is active.**")
+        source_type = "🌐 URL" if current_file is None else "📁 File"
+        await message.reply(f"🔴 **Stream is active.** ({source_type})")
     else:
         await message.reply("⚪ **No active stream.**")
 
@@ -326,8 +413,6 @@ async def status_cmd(client: Client, message: Message):
 async def stop_stream(client: Client, message: Message):
     global current_stream, stream_task
 
-    # Capture local references immediately — watch_stream's finally block
-    # sets the globals to None, so they may be cleared before we use them.
     proc = current_stream
     task = stream_task
 
@@ -343,12 +428,8 @@ async def stop_stream(client: Client, message: Message):
             except asyncio.CancelledError:
                 pass
 
-        # Kill the process directly using the local reference.
-        # watch_stream's finally may have already set current_stream = None
-        # by this point, but proc still holds the original reference.
         await kill_process(proc)
 
-        # Ensure globals are cleared in case watch_stream didn't run its finally
         current_stream = None
         stream_task = None
 
@@ -359,11 +440,109 @@ async def stop_stream(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
+# /addadmin  — owner only
+# Saves to DB and updates the in-memory cache.
+# ─────────────────────────────────────────────────────────────
+@app.on_message(filters.command("addadmin") & filters.private)
+async def addadmin_cmd(client: Client, message: Message):
+    if not (OWNER_ID and message.from_user.id == OWNER_ID):
+        await message.reply("🚫 Only the owner can manage admins.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.reply("⚠️ Usage: `/addadmin <user_id>`")
+        return
+
+    uid = int(parts[1])
+
+    if OWNER_ID and uid == OWNER_ID:
+        await message.reply("ℹ️ Owner already has full access.")
+        return
+
+    if uid in ADMINS:
+        await message.reply(f"ℹ️ `{uid}` is already an admin.")
+        return
+
+    ok, err = await add_admin(uid)
+    if ok:
+        ADMINS.add(uid)
+        await message.reply(
+            f"✅ **Admin added:** `{uid}`\n\n"
+            "They now have full bot permissions and will be remembered after restarts."
+        )
+    else:
+        await message.reply(f"❌ **Failed to save admin to DB:**\n`{err}`")
+
+
+# ─────────────────────────────────────────────────────────────
+# /removeadmin  — owner only
+# Removes from DB and updates the in-memory cache.
+# ─────────────────────────────────────────────────────────────
+@app.on_message(filters.command("removeadmin") & filters.private)
+async def removeadmin_cmd(client: Client, message: Message):
+    if not (OWNER_ID and message.from_user.id == OWNER_ID):
+        await message.reply("🚫 Only the owner can manage admins.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.reply("⚠️ Usage: `/removeadmin <user_id>`")
+        return
+
+    uid = int(parts[1])
+
+    if uid not in ADMINS:
+        await message.reply(f"⚠️ `{uid}` is not an admin.")
+        return
+
+    deleted = await remove_admin(uid)
+    if deleted:
+        ADMINS.discard(uid)
+        await message.reply(f"✅ **Admin removed:** `{uid}`")
+    else:
+        # Shouldn't normally happen — in-memory had it but DB didn't.
+        # Still remove from cache for consistency.
+        ADMINS.discard(uid)
+        await message.reply(
+            f"⚠️ `{uid}` removed from memory but was not found in DB.\n"
+            "The cache has been cleaned up."
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# /admins  — owner only
+# Always reads fresh from DB to reflect actual persisted state.
+# ─────────────────────────────────────────────────────────────
+@app.on_message(filters.command("admins") & filters.private)
+async def admins_cmd(client: Client, message: Message):
+    if not (OWNER_ID and message.from_user.id == OWNER_ID):
+        await message.reply("🚫 Only the owner can view the admin list.")
+        return
+
+    ids = await get_all_admins()
+
+    # Keep in-memory cache in sync with whatever DB actually has
+    ADMINS.clear()
+    ADMINS.update(ids)
+
+    if not ids:
+        await message.reply(
+            "📭 No admins saved in DB yet.\n"
+            "Use `/addadmin <user_id>` to add one."
+        )
+        return
+
+    lines = "\n".join(f"• `{uid}`" for uid in sorted(ids))
+    await message.reply(f"👥 **Admins (from DB):**\n\n{lines}")
+
+
+# ─────────────────────────────────────────────────────────────
 # /save
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.command("save") & filters.private)
 async def save_cmd(client: Client, message: Message):
-    if OWNER_ID and message.from_user.id != OWNER_ID:
+    if not is_authorized(message.from_user.id):
         await message.reply("🚫 Unauthorized.")
         return
 
@@ -385,7 +564,7 @@ async def save_cmd(client: Client, message: Message):
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.command("delete") & filters.private)
 async def delete_cmd(client: Client, message: Message):
-    if OWNER_ID and message.from_user.id != OWNER_ID:
+    if not is_authorized(message.from_user.id):
         await message.reply("🚫 Unauthorized.")
         return
 
@@ -407,14 +586,13 @@ async def delete_cmd(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: delete
+# Callback: delete target
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^del:"))
 async def on_delete_cb(client: Client, cb: CallbackQuery):
-    # Answer immediately — Telegram's callback token expires in ~60 s
     await cb.answer()
 
-    if OWNER_ID and cb.from_user.id != OWNER_ID:
+    if not is_authorized(cb.from_user.id):
         await cb.message.edit_text("🚫 Unauthorized.")
         return
 
@@ -432,16 +610,35 @@ async def on_delete_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: channel selection
+# Shared helper: show target selection keyboard
+# ─────────────────────────────────────────────────────────────
+async def show_target_keyboard(message: Message, prefix: str, intro: str):
+    targets = await get_all_targets()
+    if not targets:
+        await message.reply(
+            "📭 No stream targets saved.\n"
+            "Use /save to add one first."
+        )
+        return False
+
+    buttons = [
+        [InlineKeyboardButton(f"📺 {t['name']}", callback_data=f"{prefix}:{t['name']}")]
+        for t in targets
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"{prefix}:__cancel__")])
+
+    await message.reply(intro, reply_markup=InlineKeyboardMarkup(buttons))
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
+# Callback: channel selection for FILE streaming
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^stream:"))
 async def on_stream_select_cb(client: Client, cb: CallbackQuery):
-    # Answer immediately — Telegram's callback token expires in ~60 s.
-    # Doing this before any async work (download, stream start) prevents
-    # QUERY_ID_INVALID which fires when cb.answer() is called too late.
     await cb.answer()
 
-    if OWNER_ID and cb.from_user.id != OWNER_ID:
+    if not is_authorized(cb.from_user.id):
         await cb.message.edit_text("🚫 Unauthorized.")
         return
 
@@ -464,9 +661,7 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
         return
 
     if current_stream and current_stream.returncode is None:
-        await cb.message.edit_text(
-            "⚠️ Stream already running.\nUse /stop first."
-        )
+        await cb.message.edit_text("⚠️ Stream already running.\nUse /stop first.")
         return
 
     if video_msg.video:
@@ -492,7 +687,7 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
     await status.edit_text(f"📡 Starting stream to **{name}**...")
 
     try:
-        await start_stream(file_path, target["link"], target["key"], status)
+        await start_stream(file_path, target["link"], target["key"], status, is_url_source=False)
     except Exception as e:
         await status.edit_text(f"❌ Stream failed:\n`{e}`")
         try:
@@ -503,54 +698,120 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Text handler — /save replies
+# Callback: channel selection for URL streaming
+# ─────────────────────────────────────────────────────────────
+@app.on_callback_query(filters.regex(r"^urlstream:"))
+async def on_url_stream_select_cb(client: Client, cb: CallbackQuery):
+    await cb.answer()
+
+    if not is_authorized(cb.from_user.id):
+        await cb.message.edit_text("🚫 Unauthorized.")
+        return
+
+    uid = cb.from_user.id
+    name = cb.data[10:]  # strip "urlstream:"
+
+    if name == "__cancel__":
+        _pending_url.pop(uid, None)
+        await cb.message.edit_text("❌ Cancelled.")
+        return
+
+    source_url = _pending_url.pop(uid, None)
+    if not source_url:
+        await cb.message.edit_text("⚠️ Session expired. Please send the URL again.")
+        return
+
+    target = await get_target(name)
+    if not target:
+        await cb.message.edit_text(f"⚠️ Target `{name}` not found in DB.")
+        return
+
+    if current_stream and current_stream.returncode is None:
+        await cb.message.edit_text("⚠️ Stream already running.\nUse /stop first.")
+        return
+
+    await cb.message.edit_text(
+        f"🌐 **Starting URL stream to {name}...**\n\n"
+        f"`{source_url[:80]}{'...' if len(source_url) > 80 else ''}`"
+    )
+
+    try:
+        await start_stream(source_url, target["link"], target["key"], cb.message, is_url_source=True)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ Stream failed:\n`{e}`")
+
+
+# ─────────────────────────────────────────────────────────────
+# Text handler — /save replies AND direct URL input
 # ─────────────────────────────────────────────────────────────
 @app.on_message(
     filters.private
     & filters.text
-    & ~filters.command(["start", "save", "delete", "status", "stop", "ping_db"])
+    & ~filters.command([
+        "start", "save", "delete", "status", "stop", "ping_db",
+        "addadmin", "removeadmin", "admins",
+    ])
 )
 async def on_text(client: Client, message: Message):
     uid = message.from_user.id
+    text = message.text.strip()
 
-    if uid not in _save_pending:
+    # ── /save reply flow ──────────────────────────────────────
+    if uid in _save_pending:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if len(lines) != 3:
+            await message.reply(
+                "⚠️ Invalid format. Send exactly 3 lines:\n"
+                "`{link}`\n`{key}`\n`{name}`"
+            )
+            return
+
+        link, key, name = lines
+        _save_pending.discard(uid)
+
+        ok, err = await save_target(name=name, link=link, key=key)
+        if ok:
+            await message.reply(
+                f"✅ **Saved!**\n\n"
+                f"📛 Name: `{name}`\n"
+                f"🔗 Link: `{link}`\n"
+                f"🔑 Key: `{key}`"
+            )
+        else:
+            await message.reply(
+                f"❌ **Failed to save.**\n\n"
+                f"**Error:** `{err}`\n\n"
+                f"Run /ping\\_db to test your MongoDB connection."
+            )
         return
 
-    lines = [l.strip() for l in message.text.strip().splitlines() if l.strip()]
-    if len(lines) != 3:
-        await message.reply(
-            "⚠️ Invalid format. Send exactly 3 lines:\n"
-            "`{link}`\n`{key}`\n`{name}`"
+    # ── Direct URL stream flow ────────────────────────────────
+    if is_url(text):
+        if not is_authorized(uid):
+            await message.reply("🚫 Unauthorized.")
+            return
+
+        _pending_url[uid] = text
+        shown = text[:80] + ("..." if len(text) > 80 else "")
+        intro = (
+            f"🌐 **Direct URL detected:**\n`{shown}`\n\n"
+            "📡 **Select a stream target:**\n\n"
+            "ℹ️ _No download — FFmpeg reads from the URL directly. Zero extra CPU._"
         )
+        await show_target_keyboard(message, "urlstream", intro)
         return
 
-    link, key, name = lines
-    _save_pending.discard(uid)
-
-    ok, err = await save_target(name=name, link=link, key=key)
-    if ok:
-        await message.reply(
-            f"✅ **Saved!**\n\n"
-            f"📛 Name: `{name}`\n"
-            f"🔗 Link: `{link}`\n"
-            f"🔑 Key: `{key}`"
-        )
-    else:
-        await message.reply(
-            f"❌ **Failed to save.**\n\n"
-            f"**Error:** `{err}`\n\n"
-            f"Run /ping\\_db to test your MongoDB connection."
-        )
+    # Unknown text — ignore silently
 
 
 # ─────────────────────────────────────────────────────────────
-# Video handler
+# Video / document handler
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_video(client: Client, message: Message):
     uid = message.from_user.id
 
-    if OWNER_ID and uid != OWNER_ID:
+    if not is_authorized(uid):
         await message.reply("🚫 Unauthorized.")
         return
 
@@ -564,36 +825,25 @@ async def handle_video(client: Client, message: Message):
         await message.reply("❌ Please send a video file.")
         return
 
-    targets = await get_all_targets()
-    if not targets:
-        await message.reply(
-            "📭 No stream targets saved.\n"
-            "Use /save to add one first."
-        )
-        return
-
     _pending_video[uid] = message
 
-    buttons = [
-        [InlineKeyboardButton(f"📺 {t['name']}", callback_data=f"stream:{t['name']}")]
-        for t in targets
-    ]
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="stream:__cancel__")])
-
-    await message.reply(
-        "📡 **Select a stream target:**",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    await show_target_keyboard(message, "stream", "📡 **Select a stream target:**")
 
 
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    thread = threading.Thread(target=run_health_server, daemon=True)
-    thread.start()
-
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
     print(f"✅ Health server running on port {PORT}")
-    print("✅ Bot starting...")
 
+    # Load admins from DB before the bot starts accepting messages.
+    # app.run() starts its own event loop, so we run the coroutine
+    # synchronously right here using a temporary loop.
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(load_admins_from_db())
+    loop.close()
+
+    print("✅ Bot starting...")
     app.run()
