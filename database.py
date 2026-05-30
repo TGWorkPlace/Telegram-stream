@@ -2,29 +2,34 @@
 import motor.motor_asyncio
 from config import MONGO_URI
 
-_client = None
-_targets_col = None
-_admins_col = None
+# ─────────────────────────────────────────────────────────────
+# All Motor objects are created lazily inside async functions so
+# they are always bound to the *running* event loop (the one
+# Pyrogram starts).  Never create them at import time or inside
+# a temporary loop — Motor will reject operations on a closed loop.
+# ─────────────────────────────────────────────────────────────
+
+_client: motor.motor_asyncio.AsyncIOMotorClient | None = None
+_db = None
 
 
-def _get_targets_col():
-    global _client, _targets_col
-    if _targets_col is None:
+async def _get_db():
+    """Return the Motor database, creating the client if needed."""
+    global _client, _db
+    if _client is None:
         _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
         _db = _client["streamer_bot"]
-        _targets_col = _db["stream_targets"]
-    return _targets_col
+    return _db
 
 
-def _get_admins_col():
-    global _client, _admins_col
-    if _admins_col is None:
-        # Re-use the same client if already created by _get_targets_col()
-        if _client is None:
-            _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        _db = _client["streamer_bot"]
-        _admins_col = _db["admins"]
-    return _admins_col
+async def _targets():
+    db = await _get_db()
+    return db["stream_targets"]
+
+
+async def _admins():
+    db = await _get_db()
+    return db["admins"]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -34,7 +39,7 @@ def _get_admins_col():
 async def save_target(name: str, link: str, key: str) -> tuple[bool, str]:
     """Insert or replace a stream target by name. Returns (success, error_msg)."""
     try:
-        col = _get_targets_col()
+        col = await _targets()
         await col.update_one(
             {"name": name},
             {"$set": {"name": name, "link": link, "key": key}},
@@ -47,7 +52,7 @@ async def save_target(name: str, link: str, key: str) -> tuple[bool, str]:
 
 async def get_all_targets() -> list[dict]:
     try:
-        col = _get_targets_col()
+        col = await _targets()
         return await col.find({}, {"_id": 0}).to_list(length=None)
     except Exception as e:
         print(f"[DB] get_all_targets error: {e}")
@@ -56,7 +61,7 @@ async def get_all_targets() -> list[dict]:
 
 async def get_target(name: str) -> dict | None:
     try:
-        col = _get_targets_col()
+        col = await _targets()
         return await col.find_one({"name": name}, {"_id": 0})
     except Exception as e:
         print(f"[DB] get_target error: {e}")
@@ -65,7 +70,7 @@ async def get_target(name: str) -> dict | None:
 
 async def delete_target(name: str) -> bool:
     try:
-        col = _get_targets_col()
+        col = await _targets()
         result = await col.delete_one({"name": name})
         return result.deleted_count > 0
     except Exception as e:
@@ -81,10 +86,10 @@ async def add_admin(user_id: int) -> tuple[bool, str]:
     """
     Persist a new admin user_id.
     Returns (True, "") on success, (False, error) on failure.
-    Silently succeeds (upsert) if the user is already an admin.
+    Upserts so calling twice is safe.
     """
     try:
-        col = _get_admins_col()
+        col = await _admins()
         await col.update_one(
             {"user_id": user_id},
             {"$set": {"user_id": user_id}},
@@ -101,7 +106,7 @@ async def remove_admin(user_id: int) -> bool:
     Returns True if a document was deleted, False otherwise.
     """
     try:
-        col = _get_admins_col()
+        col = await _admins()
         result = await col.delete_one({"user_id": user_id})
         return result.deleted_count > 0
     except Exception as e:
@@ -112,7 +117,7 @@ async def remove_admin(user_id: int) -> bool:
 async def get_all_admins() -> list[int]:
     """Return a list of all persisted admin user_ids."""
     try:
-        col = _get_admins_col()
+        col = await _admins()
         docs = await col.find({}, {"_id": 0, "user_id": 1}).to_list(length=None)
         return [d["user_id"] for d in docs]
     except Exception as e:
@@ -123,7 +128,7 @@ async def get_all_admins() -> list[int]:
 async def is_admin_in_db(user_id: int) -> bool:
     """Return True if user_id exists in the admins collection."""
     try:
-        col = _get_admins_col()
+        col = await _admins()
         doc = await col.find_one({"user_id": user_id}, {"_id": 1})
         return doc is not None
     except Exception as e:
@@ -137,7 +142,7 @@ async def is_admin_in_db(user_id: int) -> bool:
 
 async def ping_db() -> tuple[bool, str]:
     try:
-        _get_targets_col()          # ensures _client is initialised
+        await _get_db()          # ensures _client is initialised
         await _client.admin.command("ping")
         return True, "MongoDB connection OK"
     except Exception as e:
