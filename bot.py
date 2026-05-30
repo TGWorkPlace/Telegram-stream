@@ -343,12 +343,12 @@ async def start_cmd(client: Client, message: Message):
         "(no download — saves server CPU).\n\n"
         "**Commands:**\n"
         "• /start — Show help\n"
-        "• /stream\\_url — Stream from a direct URL\n"
+        "• /stream_url — Stream from a direct URL\n"
         "• /save — Save a stream target\n"
         "• /delete — Delete a stream target\n"
         "• /status — Stream status\n"
         "• /stop — Stop stream\n"
-        "• /ping\\_db — Test DB connection"
+        "• /ping_db — Test DB connection"
     )
 
 
