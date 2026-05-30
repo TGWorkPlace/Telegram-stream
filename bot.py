@@ -326,21 +326,32 @@ async def status_cmd(client: Client, message: Message):
 async def stop_stream(client: Client, message: Message):
     global current_stream, stream_task
 
-    if not current_stream:
+    # Capture local references immediately — watch_stream's finally block
+    # sets the globals to None, so they may be cleared before we use them.
+    proc = current_stream
+    task = stream_task
+
+    if not proc:
         await message.reply("⚪ No active stream.")
         return
 
     try:
-        if stream_task and not stream_task.done():
-            stream_task.cancel()
+        if task and not task.done():
+            task.cancel()
             try:
-                await stream_task
+                await task
             except asyncio.CancelledError:
                 pass
 
-        await kill_process(current_stream)
+        # Kill the process directly using the local reference.
+        # watch_stream's finally may have already set current_stream = None
+        # by this point, but proc still holds the original reference.
+        await kill_process(proc)
+
+        # Ensure globals are cleared in case watch_stream didn't run its finally
         current_stream = None
         stream_task = None
+
         await message.reply("⏹️ **Stream stopped.**")
 
     except Exception as e:
