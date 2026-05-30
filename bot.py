@@ -411,15 +411,17 @@ async def delete_cmd(client: Client, message: Message):
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^del:"))
 async def on_delete_cb(client: Client, cb: CallbackQuery):
+    # Answer immediately — Telegram's callback token expires in ~60 s
+    await cb.answer()
+
     if OWNER_ID and cb.from_user.id != OWNER_ID:
-        await cb.answer("🚫 Unauthorized.", show_alert=True)
+        await cb.message.edit_text("🚫 Unauthorized.")
         return
 
     name = cb.data[4:]
 
     if name == "__cancel__":
         await cb.message.edit_text("❌ Cancelled.")
-        await cb.answer()
         return
 
     deleted = await delete_target(name)
@@ -428,16 +430,19 @@ async def on_delete_cb(client: Client, cb: CallbackQuery):
     else:
         await cb.message.edit_text(f"⚠️ Target `{name}` not found.")
 
-    await cb.answer()
-
 
 # ─────────────────────────────────────────────────────────────
 # Callback: channel selection
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^stream:"))
 async def on_stream_select_cb(client: Client, cb: CallbackQuery):
+    # Answer immediately — Telegram's callback token expires in ~60 s.
+    # Doing this before any async work (download, stream start) prevents
+    # QUERY_ID_INVALID which fires when cb.answer() is called too late.
+    await cb.answer()
+
     if OWNER_ID and cb.from_user.id != OWNER_ID:
-        await cb.answer("🚫 Unauthorized.", show_alert=True)
+        await cb.message.edit_text("🚫 Unauthorized.")
         return
 
     uid = cb.from_user.id
@@ -446,26 +451,22 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
     if name == "__cancel__":
         _pending_video.pop(uid, None)
         await cb.message.edit_text("❌ Cancelled.")
-        await cb.answer()
         return
 
     video_msg = _pending_video.pop(uid, None)
     if not video_msg:
         await cb.message.edit_text("⚠️ Session expired. Please resend the video.")
-        await cb.answer()
         return
 
     target = await get_target(name)
     if not target:
         await cb.message.edit_text(f"⚠️ Target `{name}` not found in DB.")
-        await cb.answer()
         return
 
     if current_stream and current_stream.returncode is None:
         await cb.message.edit_text(
             "⚠️ Stream already running.\nUse /stop first."
         )
-        await cb.answer()
         return
 
     if video_msg.video:
@@ -486,7 +487,6 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
         )
     except Exception as e:
         await status.edit_text(f"❌ Download failed:\n`{e}`")
-        await cb.answer()
         return
 
     await status.edit_text(f"📡 Starting stream to **{name}**...")
@@ -500,8 +500,6 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
                 os.remove(file_path)
         except Exception:
             pass
-
-    await cb.answer()
 
 
 # ─────────────────────────────────────────────────────────────
