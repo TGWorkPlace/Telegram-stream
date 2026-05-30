@@ -1,54 +1,66 @@
+# database.py
 import motor.motor_asyncio
 from config import MONGO_URI
 
-# ─────────────────────────────────────────────────────────────
-# MongoDB client
-# ─────────────────────────────────────────────────────────────
-_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-_db = _client["streamer_bot"]
-_col = _db["stream_targets"]
+_client = None
+_col = None
 
 
-# ─────────────────────────────────────────────────────────────
-# CRUD helpers
-# ─────────────────────────────────────────────────────────────
-async def save_target(name: str, link: str, key: str) -> bool:
-    """Insert or replace a stream target by name. Returns True on success."""
+def _get_col():
+    global _client, _col
+    if _col is None:
+        _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        _db = _client["streamer_bot"]
+        _col = _db["stream_targets"]
+    return _col
+
+
+async def save_target(name: str, link: str, key: str) -> tuple[bool, str]:
+    """Insert or replace a stream target by name. Returns (success, error_msg)."""
     try:
-        await _col.update_one(
+        col = _get_col()
+        await col.update_one(
             {"name": name},
             {"$set": {"name": name, "link": link, "key": key}},
             upsert=True,
         )
-        return True
+        return True, ""
     except Exception as e:
-        print(f"[DB] save_target error: {e}")
-        return False
+        return False, str(e)
 
 
 async def get_all_targets() -> list[dict]:
-    """Return all saved targets as a list of dicts."""
     try:
-        return await _col.find({}, {"_id": 0}).to_list(length=None)
+        col = _get_col()
+        return await col.find({}, {"_id": 0}).to_list(length=None)
     except Exception as e:
         print(f"[DB] get_all_targets error: {e}")
         return []
 
 
 async def get_target(name: str) -> dict | None:
-    """Return a single target by name, or None."""
     try:
-        return await _col.find_one({"name": name}, {"_id": 0})
+        col = _get_col()
+        return await col.find_one({"name": name}, {"_id": 0})
     except Exception as e:
         print(f"[DB] get_target error: {e}")
         return None
 
 
 async def delete_target(name: str) -> bool:
-    """Delete a target by name. Returns True if something was deleted."""
     try:
-        result = await _col.delete_one({"name": name})
+        col = _get_col()
+        result = await col.delete_one({"name": name})
         return result.deleted_count > 0
     except Exception as e:
         print(f"[DB] delete_target error: {e}")
         return False
+
+
+async def ping_db() -> tuple[bool, str]:
+    try:
+        col = _get_col()
+        await _client.admin.command("ping")
+        return True, "MongoDB connection OK"
+    except Exception as e:
+        return False, str(e)
