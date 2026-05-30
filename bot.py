@@ -8,7 +8,7 @@ import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -21,50 +21,26 @@ from config import (
     API_HASH,
     BOT_TOKEN,
     OWNER_ID,
+    ADMINS,  # list[int] — admin user IDs (owner always has access too)
     PORT,
 )
-from database import (
-    save_target, get_all_targets, get_target, delete_target, ping_db,
-    add_admin, remove_admin, get_all_admins,
-)
+from database import save_target, get_all_targets, get_target, delete_target, ping_db
 
-# ─────────────────────────────────────────────────────────────
-# uvloop — import only; do NOT set the event loop policy here.
-# Setting it before asyncio.run() causes Pyrogram's SQLite
-# storage to bind to a different loop → "attached to a different
-# loop" RuntimeError.  We call uvloop.run() directly instead.
-# ─────────────────────────────────────────────────────────────
 try:
     import uvloop
-    _UVLOOP = True
-except ImportError:
-    _UVLOOP = False
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
 
 
 # ─────────────────────────────────────────────────────────────
-# ADMINS — in-memory cache, seeded from DB inside _main()
-# after the event loop is running.  OWNER_ID always passes.
+# Auth helper
 # ─────────────────────────────────────────────────────────────
-ADMINS: set[int] = set()
-
-
 def is_authorized(user_id: int) -> bool:
+    """Return True if the user is the owner or in the ADMINS list."""
     if OWNER_ID and user_id == OWNER_ID:
         return True
     return user_id in ADMINS
-
-
-# ─────────────────────────────────────────────────────────────
-# URL detector
-# ─────────────────────────────────────────────────────────────
-URL_RE = re.compile(
-    r"^(https?|rtmp|rtmps|rtsp|mms|srt)://\S+",
-    re.IGNORECASE,
-)
-
-
-def is_url(text: str) -> bool:
-    return bool(URL_RE.match(text.strip()))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -97,11 +73,11 @@ app = Client(
 
 current_stream: asyncio.subprocess.Process | None = None
 stream_task: asyncio.Task | None = None
-current_file: str | None = None
+current_file: str | None = None   # None when streaming from URL
 
 _save_pending: set[int] = set()
 _pending_video: dict[int, Message] = {}
-_pending_url: dict[int, str] = {}
+_pending_url: dict[int, str] = {}   # uid → direct stream URL
 
 
 # ─────────────────────────────────────────────────────────────
@@ -137,6 +113,10 @@ def fmt_time(s: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def is_url(text: str) -> bool:
+    return bool(re.match(r"^https?://", text.strip()))
+
+
 # ─────────────────────────────────────────────────────────────
 # Download progress callback
 # ─────────────────────────────────────────────────────────────
@@ -148,10 +128,12 @@ def make_progress_callback(status_msg: Message, total_size: int):
         now = time.time()
         if now - state["last_t"] < 7 and current != total:
             return
+
         elapsed = now - start
         speed = current / elapsed if elapsed > 0 else 0
         pct = (current / total * 100) if total else 0
         eta = (total - current) / speed if speed > 0 else 0
+
         text = (
             f"📥 **Downloading**\n"
             f"{make_bar(pct)}\n"
@@ -164,6 +146,7 @@ def make_progress_callback(status_msg: Message, total_size: int):
             await status_msg.edit_text(text)
         except Exception:
             pass
+
         state["last_t"] = now
 
     return progress
@@ -187,9 +170,10 @@ async def kill_process(process: asyncio.subprocess.Process):
 
 
 # ─────────────────────────────────────────────────────────────
-# Get video duration  (works for both local files and URLs)
+# Get video duration
 # ─────────────────────────────────────────────────────────────
 async def get_duration(source: str) -> float:
+    """Works for both local file paths and HTTP/RTMP/HLS URLs."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe",
@@ -211,9 +195,10 @@ async def get_duration(source: str) -> float:
 # ─────────────────────────────────────────────────────────────
 async def watch_stream(
     process: asyncio.subprocess.Process,
-    file_path: str | None,
+    source: str,              # file path OR URL (used only for cleanup label)
     status_msg: Message,
     total_duration: float,
+    is_file: bool = True,     # True → delete source after stream
 ):
     global current_stream, stream_task, current_file
 
@@ -224,9 +209,11 @@ async def watch_stream(
             await asyncio.sleep(7)
             if process.returncode is not None:
                 break
+
             elapsed = time.time() - stream_start
             pct = min((elapsed / total_duration * 100) if total_duration > 0 else 0, 100.0)
             total_fmt = fmt_time(total_duration) if total_duration > 0 else "--:--"
+
             text = (
                 f"📡 **Broadcasting....**\n"
                 f"{make_bar(pct)}\n"
@@ -256,11 +243,11 @@ async def watch_stream(
             await status_msg.edit_text("✅ **Stream ended.**")
         except Exception:
             pass
-        if file_path:
+        if is_file:
             try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    print(f"🗑 Deleted: {file_path}")
+                if os.path.exists(source):
+                    os.remove(source)
+                    print(f"🗑 Deleted: {source}")
             except Exception as e:
                 print(f"Cleanup error: {e}")
 
@@ -268,20 +255,27 @@ async def watch_stream(
 # ─────────────────────────────────────────────────────────────
 # Build FFmpeg command
 # ─────────────────────────────────────────────────────────────
-def build_ffmpeg_cmd(
-    source: str,
-    rtmp_url: str,
-    stream_key: str,
-    is_url_source: bool,
-) -> list[str]:
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-    if is_url_source:
-        cmd += [
+def _build_ffmpeg_cmd(source: str, rtmp_url: str, stream_key: str, from_url: bool) -> list[str]:
+    """
+    For URL sources we pass the input directly — FFmpeg reads over the
+    network so the server never stores or transcodes the file.
+    For both modes we copy streams (no re-encoding) to keep CPU near zero.
+    """
+    base = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+    ]
+
+    if from_url:
+        # Let FFmpeg handle reconnect for live/HLS streams
+        base += [
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
         ]
-    cmd += [
+
+    base += [
         "-re",
         "-fflags", "nobuffer",
         "-flags", "low_delay",
@@ -294,23 +288,24 @@ def build_ffmpeg_cmd(
         "-f", "flv",
         f"{rtmp_url}{stream_key}",
     ]
-    return cmd
+    return base
 
 
 # ─────────────────────────────────────────────────────────────
-# Start stream  (unified for file and URL)
+# Start stream
 # ─────────────────────────────────────────────────────────────
 async def start_stream(
     source: str,
     rtmp_url: str,
     stream_key: str,
     status_msg: Message,
-    is_url_source: bool = False,
+    from_url: bool = False,
 ):
     global current_stream, stream_task, current_file
 
     total_duration = await get_duration(source)
-    ffmpeg_cmd = build_ffmpeg_cmd(source, rtmp_url, stream_key, is_url_source)
+
+    ffmpeg_cmd = _build_ffmpeg_cmd(source, rtmp_url, stream_key, from_url)
 
     current_stream = await asyncio.create_subprocess_exec(
         *ffmpeg_cmd,
@@ -318,16 +313,21 @@ async def start_stream(
         stderr=asyncio.subprocess.DEVNULL,
     )
 
-    file_to_clean = None if is_url_source else source
-    current_file = file_to_clean
+    current_file = None if from_url else source
 
     stream_task = asyncio.create_task(
-        watch_stream(current_stream, file_to_clean, status_msg, total_duration)
+        watch_stream(
+            current_stream,
+            source,
+            status_msg,
+            total_duration,
+            is_file=not from_url,
+        )
     )
 
-    source_label = "🌐 URL" if is_url_source else "📁 File"
+    label = "🌐 URL" if from_url else "📁 File"
     await status_msg.edit_text(
-        f"🔴 **Streaming live!** ({source_label})\n\n"
+        f"🔴 **Streaming live!** ({label})\n\n"
         "Use /stop to end stream."
     )
 
@@ -339,18 +339,16 @@ async def start_stream(
 async def start_cmd(client: Client, message: Message):
     await message.reply(
         "👋 **Telegram Stream Bot**\n\n"
-        "Send a **video file** or a **direct URL** and I will stream it live.\n\n"
+        "Send a **video file** or use **/stream\\_url** to stream directly from a URL "
+        "(no download — saves server CPU).\n\n"
         "**Commands:**\n"
         "• /start — Show help\n"
+        "• /stream\\_url — Stream from a direct URL\n"
         "• /save — Save a stream target\n"
         "• /delete — Delete a stream target\n"
         "• /status — Stream status\n"
         "• /stop — Stop stream\n"
-        "• /addadmin `<user_id>` — Grant admin access _(owner only)_\n"
-        "• /removeadmin `<user_id>` — Revoke admin access _(owner only)_\n"
-        "• /admins — List all admins _(owner only)_\n"
-        "• /ping\\_db — Test DB connection\n\n"
-        "ℹ️ URL streaming uses **zero transcoding CPU** — forwarded directly."
+        "• /ping\\_db — Test DB connection"
     )
 
 
@@ -362,6 +360,7 @@ async def ping_db_cmd(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
         await message.reply("🚫 Unauthorized.")
         return
+
     msg = await message.reply("🔄 Pinging MongoDB...")
     ok, info = await ping_db()
     if ok:
@@ -376,8 +375,8 @@ async def ping_db_cmd(client: Client, message: Message):
 @app.on_message(filters.command("status") & filters.private)
 async def status_cmd(client: Client, message: Message):
     if current_stream and current_stream.returncode is None:
-        source_type = "🌐 URL" if current_file is None else "📁 File"
-        await message.reply(f"🔴 **Stream is active.** ({source_type})")
+        source_label = "🌐 URL stream" if current_file is None else f"📁 `{os.path.basename(current_file)}`"
+        await message.reply(f"🔴 **Stream is active.**\nSource: {source_label}")
     else:
         await message.reply("⚪ **No active stream.**")
 
@@ -403,102 +402,66 @@ async def stop_stream(client: Client, message: Message):
                 await task
             except asyncio.CancelledError:
                 pass
+
         await kill_process(proc)
+
         current_stream = None
         stream_task = None
+
         await message.reply("⏹️ **Stream stopped.**")
+
     except Exception as e:
         await message.reply(f"❌ Stop failed:\n`{e}`")
 
 
 # ─────────────────────────────────────────────────────────────
-# /addadmin  — owner only
+# /stream_url — stream directly from a URL
 # ─────────────────────────────────────────────────────────────
-@app.on_message(filters.command("addadmin") & filters.private)
-async def addadmin_cmd(client: Client, message: Message):
-    if not (OWNER_ID and message.from_user.id == OWNER_ID):
-        await message.reply("🚫 Only the owner can manage admins.")
+@app.on_message(filters.command("stream_url") & filters.private)
+async def stream_url_cmd(client: Client, message: Message):
+    if not is_authorized(message.from_user.id):
+        await message.reply("🚫 Unauthorized.")
         return
 
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.reply("⚠️ Usage: `/addadmin <user_id>`")
-        return
+    uid = message.from_user.id
 
-    uid = int(parts[1])
-
-    if OWNER_ID and uid == OWNER_ID:
-        await message.reply("ℹ️ Owner already has full access.")
-        return
-
-    if uid in ADMINS:
-        await message.reply(f"ℹ️ `{uid}` is already an admin.")
-        return
-
-    ok, err = await add_admin(uid)
-    if ok:
-        ADMINS.add(uid)
-        await message.reply(
-            f"✅ **Admin added:** `{uid}`\n\n"
-            "They now have full bot permissions and will be remembered after restarts."
-        )
+    # Allow inline usage: /stream_url https://example.com/live.m3u8
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 2 and is_url(parts[1]):
+        _pending_url[uid] = parts[1].strip()
     else:
-        await message.reply(f"❌ **Failed to save admin to DB:**\n`{err}`")
-
-
-# ─────────────────────────────────────────────────────────────
-# /removeadmin  — owner only
-# ─────────────────────────────────────────────────────────────
-@app.on_message(filters.command("removeadmin") & filters.private)
-async def removeadmin_cmd(client: Client, message: Message):
-    if not (OWNER_ID and message.from_user.id == OWNER_ID):
-        await message.reply("🚫 Only the owner can manage admins.")
-        return
-
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.reply("⚠️ Usage: `/removeadmin <user_id>`")
-        return
-
-    uid = int(parts[1])
-
-    if uid not in ADMINS:
-        await message.reply(f"⚠️ `{uid}` is not an admin.")
-        return
-
-    deleted = await remove_admin(uid)
-    ADMINS.discard(uid)
-    if deleted:
-        await message.reply(f"✅ **Admin removed:** `{uid}`")
-    else:
+        _pending_url[uid] = ""   # mark as expecting URL next message
         await message.reply(
-            f"⚠️ `{uid}` removed from memory but was not found in DB.\n"
-            "Cache has been cleaned up."
-        )
-
-
-# ─────────────────────────────────────────────────────────────
-# /admins  — owner only
-# ─────────────────────────────────────────────────────────────
-@app.on_message(filters.command("admins") & filters.private)
-async def admins_cmd(client: Client, message: Message):
-    if not (OWNER_ID and message.from_user.id == OWNER_ID):
-        await message.reply("🚫 Only the owner can view the admin list.")
-        return
-
-    ids = await get_all_admins()
-    ADMINS.clear()
-    ADMINS.update(ids)
-
-    if not ids:
-        await message.reply(
-            "📭 No admins saved in DB yet.\n"
-            "Use `/addadmin <user_id>` to add one."
+            "🌐 **Direct URL Streaming**\n\n"
+            "Send the **direct media URL** to stream.\n"
+            "Supports HTTP/HTTPS (MP4, MKV, TS), HLS (`.m3u8`), DASH, RTMP, etc.\n\n"
+            "No file is downloaded — FFmpeg reads it over the network, "
+            "keeping server CPU and disk usage near zero."
         )
         return
 
-    lines = "\n".join(f"• `{uid}`" for uid in sorted(ids))
-    await message.reply(f"👥 **Admins (from DB):**\n\n{lines}")
+    await _show_target_picker_for_url(message, uid)
+
+
+async def _show_target_picker_for_url(message: Message, uid: int):
+    targets = await get_all_targets()
+    if not targets:
+        _pending_url.pop(uid, None)
+        await message.reply(
+            "📭 No stream targets saved.\nUse /save to add one first."
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(f"📺 {t['name']}", callback_data=f"urlstream:{t['name']}")]
+        for t in targets
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="urlstream:__cancel__")])
+
+    await message.reply(
+        f"🌐 **URL queued.** Select stream target:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -509,6 +472,7 @@ async def save_cmd(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
         await message.reply("🚫 Unauthorized.")
         return
+
     _save_pending.add(message.from_user.id)
     await message.reply(
         "📋 **Send stream target in this format:**\n\n"
@@ -541,6 +505,7 @@ async def delete_cmd(client: Client, message: Message):
         for t in targets
     ]
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="del:__cancel__")])
+
     await message.reply(
         "🗑 **Select a target to delete:**",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -548,16 +513,18 @@ async def delete_cmd(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: delete target
+# Callback: delete
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^del:"))
 async def on_delete_cb(client: Client, cb: CallbackQuery):
     await cb.answer()
+
     if not is_authorized(cb.from_user.id):
         await cb.message.edit_text("🚫 Unauthorized.")
         return
 
     name = cb.data[4:]
+
     if name == "__cancel__":
         await cb.message.edit_text("❌ Cancelled.")
         return
@@ -570,32 +537,56 @@ async def on_delete_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Shared helper: show target selection keyboard
+# Callback: URL stream target selection
 # ─────────────────────────────────────────────────────────────
-async def show_target_keyboard(message: Message, prefix: str, intro: str) -> bool:
-    targets = await get_all_targets()
-    if not targets:
-        await message.reply(
-            "📭 No stream targets saved.\n"
-            "Use /save to add one first."
-        )
-        return False
+@app.on_callback_query(filters.regex(r"^urlstream:"))
+async def on_urlstream_select_cb(client: Client, cb: CallbackQuery):
+    await cb.answer()
 
-    buttons = [
-        [InlineKeyboardButton(f"📺 {t['name']}", callback_data=f"{prefix}:{t['name']}")]
-        for t in targets
-    ]
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"{prefix}:__cancel__")])
-    await message.reply(intro, reply_markup=InlineKeyboardMarkup(buttons))
-    return True
+    if not is_authorized(cb.from_user.id):
+        await cb.message.edit_text("🚫 Unauthorized.")
+        return
+
+    uid = cb.from_user.id
+    name = cb.data[len("urlstream:"):]
+
+    if name == "__cancel__":
+        _pending_url.pop(uid, None)
+        await cb.message.edit_text("❌ Cancelled.")
+        return
+
+    url = _pending_url.pop(uid, None)
+    if not url:
+        await cb.message.edit_text("⚠️ Session expired. Please use /stream_url again.")
+        return
+
+    target = await get_target(name)
+    if not target:
+        await cb.message.edit_text(f"⚠️ Target `{name}` not found in DB.")
+        return
+
+    if current_stream and current_stream.returncode is None:
+        await cb.message.edit_text("⚠️ Stream already running.\nUse /stop first.")
+        return
+
+    await cb.message.edit_text(
+        f"🌐 **Starting URL stream to {name}...**\n\n"
+        f"`{url}`"
+    )
+
+    try:
+        await start_stream(url, target["link"], target["key"], cb.message, from_url=True)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ Stream failed:\n`{e}`")
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: channel selection for FILE streaming
+# Callback: channel selection (file stream)
 # ─────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^stream:"))
 async def on_stream_select_cb(client: Client, cb: CallbackQuery):
     await cb.answer()
+
     if not is_authorized(cb.from_user.id):
         await cb.message.edit_text("🚫 Unauthorized.")
         return
@@ -619,27 +610,35 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
         return
 
     if current_stream and current_stream.returncode is None:
-        await cb.message.edit_text("⚠️ Stream already running.\nUse /stop first.")
+        await cb.message.edit_text(
+            "⚠️ Stream already running.\nUse /stop first."
+        )
         return
 
-    total_size = (video_msg.video.file_size if video_msg.video else video_msg.document.file_size) or 0
+    if video_msg.video:
+        total_size = video_msg.video.file_size or 0
+    else:
+        total_size = video_msg.document.file_size or 0
 
     await cb.message.edit_text(f"⬇️ Downloading for **{name}**...")
     status = cb.message
+
     filename = f"{uuid.uuid4()}.mp4"
 
     try:
+        progress_cb = make_progress_callback(status, total_size)
         file_path = await video_msg.download(
             file_name=filename,
-            progress=make_progress_callback(status, total_size),
+            progress=progress_cb,
         )
     except Exception as e:
         await status.edit_text(f"❌ Download failed:\n`{e}`")
         return
 
     await status.edit_text(f"📡 Starting stream to **{name}**...")
+
     try:
-        await start_stream(file_path, target["link"], target["key"], status, is_url_source=False)
+        await start_stream(file_path, target["link"], target["key"], status, from_url=False)
     except Exception as e:
         await status.edit_text(f"❌ Stream failed:\n`{e}`")
         try:
@@ -650,112 +649,62 @@ async def on_stream_select_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Callback: channel selection for URL streaming
-# ─────────────────────────────────────────────────────────────
-@app.on_callback_query(filters.regex(r"^urlstream:"))
-async def on_url_stream_select_cb(client: Client, cb: CallbackQuery):
-    await cb.answer()
-    if not is_authorized(cb.from_user.id):
-        await cb.message.edit_text("🚫 Unauthorized.")
-        return
-
-    uid = cb.from_user.id
-    name = cb.data[10:]
-
-    if name == "__cancel__":
-        _pending_url.pop(uid, None)
-        await cb.message.edit_text("❌ Cancelled.")
-        return
-
-    source_url = _pending_url.pop(uid, None)
-    if not source_url:
-        await cb.message.edit_text("⚠️ Session expired. Please send the URL again.")
-        return
-
-    target = await get_target(name)
-    if not target:
-        await cb.message.edit_text(f"⚠️ Target `{name}` not found in DB.")
-        return
-
-    if current_stream and current_stream.returncode is None:
-        await cb.message.edit_text("⚠️ Stream already running.\nUse /stop first.")
-        return
-
-    await cb.message.edit_text(
-        f"🌐 **Starting URL stream to {name}...**\n\n"
-        f"`{source_url[:80]}{'...' if len(source_url) > 80 else ''}`"
-    )
-    try:
-        await start_stream(source_url, target["link"], target["key"], cb.message, is_url_source=True)
-    except Exception as e:
-        await cb.message.edit_text(f"❌ Stream failed:\n`{e}`")
-
-
-# ─────────────────────────────────────────────────────────────
-# Text handler — /save replies AND direct URL input
+# Text handler — /save replies + /stream_url URL collection
 # ─────────────────────────────────────────────────────────────
 @app.on_message(
     filters.private
     & filters.text
-    & ~filters.command([
-        "start", "save", "delete", "status", "stop", "ping_db",
-        "addadmin", "removeadmin", "admins",
-    ])
+    & ~filters.command(["start", "save", "delete", "status", "stop", "ping_db", "stream_url"])
 )
 async def on_text(client: Client, message: Message):
     uid = message.from_user.id
     text = message.text.strip()
 
-    # ── /save reply flow ──────────────────────────────────────
-    if uid in _save_pending:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if len(lines) != 3:
+    # ── Collect URL for /stream_url flow ──────────────────────
+    if uid in _pending_url and _pending_url[uid] == "":
+        if not is_url(text):
             await message.reply(
-                "⚠️ Invalid format. Send exactly 3 lines:\n"
-                "`{link}`\n`{key}`\n`{name}`"
+                "⚠️ That doesn't look like a valid URL.\n"
+                "Please send a URL starting with `http://` or `https://`."
             )
             return
-
-        link, key, name = lines
-        _save_pending.discard(uid)
-
-        ok, err = await save_target(name=name, link=link, key=key)
-        if ok:
-            await message.reply(
-                f"✅ **Saved!**\n\n"
-                f"📛 Name: `{name}`\n"
-                f"🔗 Link: `{link}`\n"
-                f"🔑 Key: `{key}`"
-            )
-        else:
-            await message.reply(
-                f"❌ **Failed to save.**\n\n"
-                f"**Error:** `{err}`\n\n"
-                f"Run /ping\\_db to test your MongoDB connection."
-            )
-        return
-
-    # ── Direct URL stream flow ────────────────────────────────
-    if is_url(text):
-        if not is_authorized(uid):
-            await message.reply("🚫 Unauthorized.")
-            return
-
         _pending_url[uid] = text
-        shown = text[:80] + ("..." if len(text) > 80 else "")
-        intro = (
-            f"🌐 **Direct URL detected:**\n`{shown}`\n\n"
-            "📡 **Select a stream target:**\n\n"
-            "ℹ️ _No download — FFmpeg reads the URL directly. Zero extra CPU._"
-        )
-        await show_target_keyboard(message, "urlstream", intro)
+        await _show_target_picker_for_url(message, uid)
         return
 
-    # Unknown text — ignore silently
+    # ── Collect target info for /save flow ───────────────────
+    if uid not in _save_pending:
+        return
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) != 3:
+        await message.reply(
+            "⚠️ Invalid format. Send exactly 3 lines:\n"
+            "`{link}`\n`{key}`\n`{name}`"
+        )
+        return
+
+    link, key, name = lines
+    _save_pending.discard(uid)
+
+    ok, err = await save_target(name=name, link=link, key=key)
+    if ok:
+        await message.reply(
+            f"✅ **Saved!**\n\n"
+            f"📛 Name: `{name}`\n"
+            f"🔗 Link: `{link}`\n"
+            f"🔑 Key: `{key}`"
+        )
+    else:
+        await message.reply(
+            f"❌ **Failed to save.**\n\n"
+            f"**Error:** `{err}`\n\n"
+            f"Run /ping\\_db to test your MongoDB connection."
+        )
 
 
 # ─────────────────────────────────────────────────────────────
-# Video / document handler
+# Video handler
 # ─────────────────────────────────────────────────────────────
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_video(client: Client, message: Message):
@@ -775,46 +724,36 @@ async def handle_video(client: Client, message: Message):
         await message.reply("❌ Please send a video file.")
         return
 
+    targets = await get_all_targets()
+    if not targets:
+        await message.reply(
+            "📭 No stream targets saved.\n"
+            "Use /save to add one first."
+        )
+        return
+
     _pending_video[uid] = message
-    await show_target_keyboard(message, "stream", "📡 **Select a stream target:**")
+
+    buttons = [
+        [InlineKeyboardButton(f"📺 {t['name']}", callback_data=f"stream:{t['name']}")]
+        for t in targets
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="stream:__cancel__")])
+
+    await message.reply(
+        "📡 **Select a stream target:**",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 # ─────────────────────────────────────────────────────────────
 # Main
-#
-# Why not asyncio.run() + uvloop.EventLoopPolicy()?
-#   Setting the policy BEFORE asyncio.run() creates a policy
-#   mismatch: Pyrogram's SQLite storage grabs the old default
-#   loop internally, then asyncio.run() creates a uvloop →
-#   "Future attached to a different loop" RuntimeError.
-#
-# Solution:
-#   • If uvloop is available → uvloop.run() creates the loop
-#     itself and everything (Pyrogram, Motor, subprocesses)
-#     is bound to that one loop from the start.
-#   • If uvloop is not installed → plain asyncio.run(), works
-#     identically, just slightly slower.
 # ─────────────────────────────────────────────────────────────
-async def _main():
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-    print(f"✅ Health server running on port {PORT}")
-
-    await app.start()
-    print("✅ Bot started.")
-
-    # Motor is first touched here — safely bound to the running loop
-    ids = await get_all_admins()
-    ADMINS.update(ids)
-    print(f"✅ Loaded {len(ids)} admin(s) from DB: {ids}")
-
-    await idle()
-    await app.stop()
-    print("✅ Bot stopped.")
-
-
 if __name__ == "__main__":
-    if _UVLOOP:
-        uvloop.run(_main())
-    else:
-        asyncio.run(_main())
+    thread = threading.Thread(target=run_health_server, daemon=True)
+    thread.start()
+
+    print(f"✅ Health server running on port {PORT}")
+    print("✅ Bot starting...")
+
+    app.run()
